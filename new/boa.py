@@ -9,7 +9,7 @@ st.set_page_config(page_title="Bank of America Statement Extractor", layout="wid
 st.title("🏦 Bank of America Statement Extractor")
 st.markdown("""
 This app extracts transactions from Bank of America PDF statements **without using AI**. 
-It uses `pdfplumber` to extract text and Regex to parse dates, descriptions, and amounts.
+It handles standard sections, **multi-column check tables**, and **missing check numbers**.
 """)
 
 def parse_bank_statement(pdf_file):
@@ -19,16 +19,26 @@ def parse_bank_statement(pdf_file):
     transactions = []
     current_section = "Unknown"
     
-    # Regex patterns specific to this statement format
-    # Matches lines starting with a date like 04/01/25
+    # 1. General Pattern: Date at start, Description in middle, Amount at end
     date_start_pattern = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+(.*?)(\-?[\d,]+\.\d{2})$')
+    
+    # 2. Specific Check Pattern: Date | Optional Check # | Amount
+    # Explanation:
+    # (\d{2}/\d{2}/\d{2})       -> Capture Group 1: Date (MM/DD/YY)
+    # \s+                       -> Required whitespace
+    # (?:(\d+\*?)\s+)?          -> Non-capturing optional group for Check #:
+    #     (\d+\*?)              -> Capture Group 2: Digits and optional '*' (e.g., "1331*")
+    #     \s+                   -> Space after check number
+    # (\-?[\d,]+\.\d{2})        -> Capture Group 3: Amount (e.g., "-366.00" or "2,000.00")
+    check_pattern = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(?:(\d+\*?)\s+)?(\-?[\d,]+\.\d{2})')
     
     # Sections keywords to switch context
     section_keywords = {
         "Deposits and other credits": "Deposits",
         "Withdrawals and other debits": "Withdrawals",
         "Checks": "Checks",
-        "Service fees": "Service Fees"
+        "Service fees": "Service Fees",
+        "Daily ledger balances": "Ignore" # Stop parsing when we hit the footer summary
     }
 
     with pdfplumber.open(pdf_file) as pdf:
@@ -46,37 +56,70 @@ def parse_bank_statement(pdf_file):
             lines = text.split('\n')
             
             for line in lines:
-                # 1. Detect Section Change
+                # --- 1. Detect Section Change ---
+                section_found = False
                 for key, section_name in section_keywords.items():
                     if key in line:
                         current_section = section_name
-                        # Stop processing this line as a transaction
-                        break 
+                        section_found = True
+                        break
                 
-                # 2. Parse Transaction Lines
-                # We look for lines that start with a Date (MM/DD/YY)
-                match = date_start_pattern.match(line)
-                
-                if match:
-                    date = match.group(1)
-                    description = match.group(2).strip()
-                    amount_str = match.group(3).replace(',', '')
-                    
-                    try:
-                        amount = float(amount_str)
-                    except ValueError:
-                        amount = 0.0
+                if section_found or current_section == "Ignore":
+                    continue
 
-                    # Checks often have a check number in the description column
-                    # Logic to clean up check numbers if needed can go here
+                # --- 2. Parse Based on Section Type ---
+                
+                # LOGIC FOR CHECKS (Multi-Column & Optional Check #)
+                if current_section == "Checks":
+                    # findall returns a list of tuples: 
+                    # e.g. [('04/08/25', '', '-366.00'), ('04/10/25', '120', '-2,000.00')]
+                    matches = check_pattern.findall(line)
                     
-                    transactions.append({
-                        "Date": date,
-                        "Description": description,
-                        "Amount": amount,
-                        "Type": current_section,
-                        "Source_Page": page.page_number
-                    })
+                    if matches:
+                        for m in matches:
+                            c_date = m[0]
+                            c_num = m[1]
+                            c_amt_str = m[2].replace(',', '')
+                            
+                            # Handle description based on whether Check # exists
+                            if c_num:
+                                c_desc = f"Check #{c_num}"
+                            else:
+                                c_desc = "Check (No #)"
+                            
+                            try:
+                                amount = float(c_amt_str)
+                            except ValueError:
+                                amount = 0.0
+                            
+                            transactions.append({
+                                "Date": c_date,
+                                "Description": c_desc,
+                                "Amount": amount,
+                                "Type": current_section,
+                                "Source_Page": page.page_number
+                            })
+                            
+                # LOGIC FOR DEPOSITS, WITHDRAWALS, FEES (Single Column / General)
+                else:
+                    match = date_start_pattern.match(line)
+                    if match:
+                        date = match.group(1)
+                        description = match.group(2).strip()
+                        amount_str = match.group(3).replace(',', '')
+                        
+                        try:
+                            amount = float(amount_str)
+                        except ValueError:
+                            amount = 0.0
+
+                        transactions.append({
+                            "Date": date,
+                            "Description": description,
+                            "Amount": amount,
+                            "Type": current_section,
+                            "Source_Page": page.page_number
+                        })
             
             # Update progress
             progress_bar.progress((idx + 1) / total_pages)
@@ -96,8 +139,8 @@ if uploaded_file:
             pdf_file = io.BytesIO(uploaded_file.read())
             df = parse_bank_statement(pdf_file)
             
-            # Filtering out the 'Unknown' section which usually captures the summary table
-            df = df[df['Type'] != 'Unknown']
+            # Filtering out 'Unknown' and 'Ignore' types
+            df = df[~df['Type'].isin(['Unknown', 'Ignore'])]
             
             if not df.empty:
                 st.success(f"Successfully extracted {len(df)} transactions!")
@@ -105,19 +148,16 @@ if uploaded_file:
                 # Show Summary
                 col1, col2, col3, col4 = st.columns(4)
                 
+                # Checks are usually negative in statement data, but we sum absolute for display
                 total_deposits = df[df['Type'] == 'Deposits']['Amount'].sum()
-                total_withdrawals = abs(df[df['Type'] == 'Withdrawals']['Amount'].sum())
-                total_checks = abs(df[df['Type'] == 'Checks']['Amount'].sum())
-                total_fees = abs(df[df['Type'] == 'Service Fees']['Amount'].sum())
+                total_withdrawals = df[df['Type'] == 'Withdrawals']['Amount'].sum()
+                total_checks = df[df['Type'] == 'Checks']['Amount'].sum()
+                total_fees = df[df['Type'] == 'Service Fees']['Amount'].sum()
                 
                 col1.metric("Total Deposits", f"${total_deposits:,.2f}")
                 col2.metric("Total Withdrawals", f"${total_withdrawals:,.2f}")
                 col3.metric("Total Checks", f"${total_checks:,.2f}")
                 col4.metric("Total Fees", f"${total_fees:,.2f}")
-                
-                # Net Change
-                net_change = total_deposits - total_withdrawals - total_checks - total_fees
-                st.metric("Net Change", f"${net_change:,.2f}")
                 
                 # Data Grid
                 st.subheader("Transaction Details")
@@ -152,22 +192,21 @@ if uploaded_file:
             st.error(f"Error parsing PDF: {str(e)}")
             st.exception(e)
 
-with st.expander("How this works (The 'No-AI' Logic)"):
-    st.code("""
-# The Logic Pattern (Regex)
-# We look for:
-# 1. A date at the start (04/01/25)
-# 2. Any text in the middle (Description)
-# 3. A monetary number at the end (-1,260.68)
+with st.expander("Regex Logic Explained"):
+    st.code(r"""
+# The Updated Check Pattern
+# (?: ... )? means the group inside is optional
+# \d+\*? matches the check number (digits) plus an optional asterisk
 
-date_start_pattern = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+(.*?)(\-?[\d,]+\.\d{2})$')
+check_pattern = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(?:(\d+\*?)\s+)?(\-?[\d,]+\.\d{2})')
 
-# Section Detection
-# The parser identifies section headers like:
-# - "Deposits and other credits"
-# - "Withdrawals and other debits"
-# - "Checks"
-# - "Service fees"
-# 
-# Transactions are categorized based on which section they appear in.
+# Example Match 1 (With Check #): "04/10/25 120 -2,000.00"
+# Group 1 (Date): "04/10/25"
+# Group 2 (Check): "120"
+# Group 3 (Amount): "-2,000.00"
+
+# Example Match 2 (No Check #): "04/08/25 -366.00"
+# Group 1 (Date): "04/08/25"
+# Group 2 (Check): "" (Empty)
+# Group 3 (Amount): "-366.00"
     """, language="python")
