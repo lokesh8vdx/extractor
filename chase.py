@@ -51,7 +51,8 @@ def extract_chase_transactions(pdf_file):
             
             # Pattern for Balance History (multi-column)
             # Finds all occurrences of "Date Amount" pairs in a line
-            balance_pattern = re.compile(r'(\d{2}/\d{2})\s+(-?\$?[\d,]+\.\d{2})')
+            # Updated to match date flexibility (single digit month or partial)
+            balance_pattern = re.compile(r'(\d{0,2}/\d{2})\s+(-?\$?[\d,]+\.\d{2})')
 
             # Pattern for Checking Summary
             # Matches: Label (text), Optional Count (int), Amount (currency)
