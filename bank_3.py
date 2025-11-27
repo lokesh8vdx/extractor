@@ -6,10 +6,10 @@ import io
 
 st.set_page_config(page_title="No-AI Bank Extractor", layout="wide")
 
-st.title("📄 Bank Statement Extractor (Rule-Based)")
+st.title("📄 Chase Statements Extractor (Rule-Based)")
 st.markdown("""
-This app extracts transactions from Chase bank statements **without using AI**. 
-It uses `pdfplumber` to spatially analyze the text layout and Regex to parse dates and amounts.
+This app extracts transactions from Chase bank statements without using AI. 
+It handles standard sections to spatially analyze the text layout and Regex to parse dates and amounts.
 """)
 
 def parse_amount(amount_str):
@@ -27,15 +27,19 @@ def extract_chase_transactions(pdf_file):
     transactions = []
     
     with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
+        for i, page in enumerate(pdf.pages):
+            page_num = i + 1
             # Extract text with layout preservation
             text = page.extract_text(x_tolerance=2, y_tolerance=2)
+            if not text:
+                continue
             lines = text.split('\n')
             
             # Chase Statement Logic
             # We look for lines that start with a date pattern like MM/DD
-            # Regex: Start of line (^), 2 digits, slash, 2 digits
-            date_pattern = re.compile(r'^(\d{2}/\d{2})\s+(.*)\s+(-?\$?[\d,]+\.\d{2})$')
+            # Modified Regex to handle lines with prefix noise (e.g. *end* markers)
+            # Matches: Optional prefix, Date (MM/DD or /DD), Description, Amount at end
+            date_pattern = re.compile(r'(?:.*?)\s*(\d{0,2}/\d{2})\s+(.*)\s+(-?\$?[\d,]+\.\d{2})$')
             
             current_section = None
             
@@ -47,23 +51,40 @@ def extract_chase_transactions(pdf_file):
                     current_section = "Deposit"
                     continue
                 elif "ATM & DEBIT CARD WITHDRAWALS" in line:
-                    current_section = "Withdrawal"
+                    current_section = "ATM & Debit Withdrawal"
                     continue
                 elif "ELECTRONIC WITHDRAWALS" in line:
-                    current_section = "Withdrawal"
+                    current_section = "Electronic Withdrawal"
                     continue
                 elif "FEES" in line:
                     current_section = "Fee"
+                    continue
+                # Stop processing when reaching Daily Ending Balance to avoid mixing it with Fees
+                elif "DAILY ENDING BALANCE" in line:
+                    current_section = None
                     continue
                 
                 # Skip irrelevant header/footer lines
                 if "Page" in line or "Account Number" in line or "Opening Balance" in line:
                     continue
 
-                # Try to match a transaction line
+                # Try to match a transaction line using search (allows prefix match)
                 match = date_pattern.match(line)
+                if not match:
+                    # Retry with search for cases where date isn't at start
+                    match = date_pattern.search(line)
+                
                 if match and current_section:
                     date, desc, amount_str = match.groups()
+                    
+                    # Fix corrupted dates (e.g. "/14" -> "04/14") found in noisy lines
+                    if date.startswith('/'):
+                        # Use previous transaction month or default to 04 (April) if unknown
+                        if transactions:
+                            last_month = transactions[-1]['Date'].split('/')[0]
+                            date = f"{last_month}{date}"
+                        else:
+                            date = f"04{date}" 
                     
                     # Clean up description (remove extra spaces)
                     desc = desc.strip()
@@ -80,7 +101,7 @@ def extract_chase_transactions(pdf_file):
                         "Description": desc,
                         "Amount": amount,
                         "Type": current_section,
-                        "Raw_Line": line 
+                        "Page": page_num 
                     })
                 
                 # HANDLE MULTI-LINE DESCRIPTIONS (Advanced Logic)
@@ -115,11 +136,25 @@ if uploaded_file:
                 # Show Summary
                 col1, col2, col3 = st.columns(3)
                 total_deposits = df[df['Type'] == 'Deposit']['Amount'].sum()
-                total_withdrawals = df[df['Type'] == 'Withdrawal']['Amount'].sum()
+                
+                # Calculate Withdrawal subtotals
+                total_atm = df[df['Type'] == 'ATM & Debit Withdrawal']['Amount'].sum()
+                total_electronic = df[df['Type'] == 'Electronic Withdrawal']['Amount'].sum()
+                total_withdrawals = total_atm + total_electronic
+                
+                total_fees = df[df['Type'] == 'Fee']['Amount'].sum()
                 
                 col1.metric("Total Deposits", f"${total_deposits:,.2f}")
-                col2.metric("Total Withdrawals", f"${total_withdrawals:,.2f}")
-                col3.metric("Net Change", f"${(total_deposits - total_withdrawals):,.2f}")
+                
+                # Custom HTML/Metric for Withdrawals with breakdown
+                col2.metric(
+                    "Total Withdrawals", 
+                    f"${total_withdrawals:,.2f}",
+                    help=f"ATM: ${total_atm:,.2f} | Electronic: ${total_electronic:,.2f}"
+                )
+                col2.caption(f"(ATM: ${total_atm:,.2f} + Elec: ${total_electronic:,.2f})")
+                
+                col3.metric("Total Fees", f"${total_fees:,.2f}")
                 
                 # Data Grid
                 st.dataframe(df, use_container_width=True)
@@ -143,9 +178,9 @@ with st.expander("How this works (The 'No-AI' Logic)"):
     st.code("""
 # The Logic Pattern (Regex)
 # We look for:
-# 1. A date at the start (08/01)
+# 1. A date at the start (08/01) or hidden in prefix text
 # 2. Any text in the middle (Description)
 # 3. A monetary number at the end (1,260.68)
 
-date_pattern = re.compile(r'^(\d{2}/\d{2})\s+(.*)\s+(-?\$?[\d,]+\.\d{2})$')
+date_pattern = re.compile(r'(?:.*?)\s*(\d{0,2}/\d{2})\s+(.*)\s+(-?\$?[\d,]+\.\d{2})$')
     """, language="python")
