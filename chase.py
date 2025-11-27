@@ -41,6 +41,9 @@ def extract_chase_transactions(pdf_file):
             # Matches: Optional prefix, Date (MM/DD or /DD), Description, Amount at end
             date_pattern = re.compile(r'(?:.*?)\s*(\d{0,2}/\d{2})\s+(.*)\s+(-?\$?[\d,]+\.\d{2})$')
             
+            # Pattern for Checks Paid: Check No, Description (optional), Date, Amount
+            check_pattern = re.compile(r'^\s*(\d+)\s+(.*?)\s+(\d{2}/\d{2})\s+(-?\$?[\d,]+\.\d{2})$')
+            
             current_section = None
             
             for line in lines:
@@ -49,6 +52,9 @@ def extract_chase_transactions(pdf_file):
                 # Detect Sections to categorize transactions
                 if "DEPOSITS AND ADDITIONS" in line:
                     current_section = "Deposit"
+                    continue
+                elif "CHECKS PAID" in line:
+                    current_section = "Checks Paid"
                     continue
                 elif "ATM & DEBIT CARD WITHDRAWALS" in line:
                     current_section = "ATM & Debit Withdrawal"
@@ -68,11 +74,39 @@ def extract_chase_transactions(pdf_file):
                 if "Page" in line or "Account Number" in line or "Opening Balance" in line:
                     continue
 
+                # HANDLE CHECKS PAID SECTION
+                if current_section == "Checks Paid":
+                    match = check_pattern.search(line)
+                    if match:
+                        check_num, desc_text, date, amount_str = match.groups()
+                        
+                        # Date fix logic for checks (usually standard MM/DD but consistent with others)
+                        if date.startswith('/'):
+                            if transactions:
+                                last_month = transactions[-1]['Date'].split('/')[0]
+                                date = f"{last_month}{date}"
+                            else:
+                                date = f"04{date}" # Default fallback
+
+                        desc = f"Check #{check_num} {desc_text.strip()}"
+                        amount = parse_amount(amount_str)
+                        
+                        transactions.append({
+                            "Date": date,
+                            "Description": desc,
+                            "Amount": amount,
+                            "Type": current_section,
+                            "Page": page_num
+                        })
+                        continue
+
                 # Try to match a transaction line using search (allows prefix match)
-                match = date_pattern.match(line)
-                if not match:
-                    # Retry with search for cases where date isn't at start
-                    match = date_pattern.search(line)
+                match = None
+                if current_section != "Checks Paid":
+                    match = date_pattern.match(line)
+                    if not match:
+                        # Retry with search for cases where date isn't at start
+                        match = date_pattern.search(line)
                 
                 if match and current_section:
                     date, desc, amount_str = match.groups()
@@ -107,7 +141,7 @@ def extract_chase_transactions(pdf_file):
                 # HANDLE MULTI-LINE DESCRIPTIONS (Advanced Logic)
                 # If a line doesn't start with a date but we just added a transaction,
                 # it's likely a continuation of the previous description.
-                elif transactions and not re.match(r'\d{2}/\d{2}', line):
+                elif transactions and not re.match(r'\d{2}/\d{2}', line) and not (current_section == "Checks Paid" and re.match(r'^\d+', line)):
                     # Check if it looks like a balance summary line or junk
                     if "$" in line and "Balance" in line:
                         continue
@@ -140,7 +174,8 @@ if uploaded_file:
                 # Calculate Withdrawal subtotals
                 total_atm = df[df['Type'] == 'ATM & Debit Withdrawal']['Amount'].sum()
                 total_electronic = df[df['Type'] == 'Electronic Withdrawal']['Amount'].sum()
-                total_withdrawals = total_atm + total_electronic
+                total_checks = df[df['Type'] == 'Checks Paid']['Amount'].sum()
+                total_withdrawals = total_atm + total_electronic + total_checks
                 
                 total_fees = df[df['Type'] == 'Fee']['Amount'].sum()
                 
@@ -150,9 +185,9 @@ if uploaded_file:
                 col2.metric(
                     "Total Withdrawals", 
                     f"${total_withdrawals:,.2f}",
-                    help=f"ATM: ${total_atm:,.2f} | Electronic: ${total_electronic:,.2f}"
+                    help=f"ATM: ${total_atm:,.2f} | Electronic: ${total_electronic:,.2f} | Checks: ${total_checks:,.2f}"
                 )
-                col2.caption(f"(ATM: ${total_atm:,.2f} + Elec: ${total_electronic:,.2f})")
+                col2.caption(f"(ATM: ${total_atm:,.2f} + Elec: ${total_electronic:,.2f} + Checks: ${total_checks:,.2f})")
                 
                 col3.metric("Total Fees", f"${total_fees:,.2f}")
                 
