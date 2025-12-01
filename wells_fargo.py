@@ -20,6 +20,8 @@ def parse_amount(amount_str):
 def identify_bank(text):
     """Scans text for bank fingerprints."""
     text_lower = text.lower()
+    if "wellsfargo.com" in text_lower:
+        return "Wells Fargo"
     if "chase" in text_lower and "jpmorgan" in text_lower:
         return "Chase"
     if "wells fargo" in text_lower:
@@ -89,11 +91,11 @@ def parse_wells_fargo_regex(pdf, current_year):
     transactions = []
     balances = []
     
-    # Regex for Standard Transactions: Date -> Amount -> Description
-    txn_pattern = re.compile(r'^\s*(\d{2}/\d{2})\s+([\d,]+\.\d{2})\s+(.*)$')
+    # Regex for Standard Transactions: Date -> [Optional Effective Date] -> Amount -> Description
+    txn_pattern = re.compile(r'^\s*(\d{2}/\d{2})\s+(?:(\d{2}/\d{2})\s+)?([\d,]+\.\d{2})\s+(.*)$')
     
-    # Regex for Checks: Check Number -> Amount -> Date
-    check_pattern = re.compile(r'^\s*(\d+)\s+([\d,]+\.\d{2})\s+(\d{2}/\d{2})')
+    # Regex for Checks: Check Number -> Amount -> Date (Multi-column support)
+    check_pattern = re.compile(r'(\d+)\s+([\d,]+\.\d{2})\s+(\d{2}/\d{2})')
 
     # Regex for Balance History: (MM/DD) (Amount)
     balance_pattern = re.compile(r'(\d{2}/\d{2})\s+([\d,]+\.\d{2})')
@@ -144,26 +146,31 @@ def parse_wells_fargo_regex(pdf, current_year):
                 if current_section == "Footer":
                     continue
 
-                # 3. MATCH CHECKS (Specific Format)
+                # 3. MATCH CHECKS (Specific Format, supports multi-column)
                 if current_section == "Checks Paid":
-                    match = check_pattern.match(line)
-                    if match:
-                        check_num, amount_str, date_part = match.groups()
-                        amount = parse_amount(amount_str)
-                        
-                        transactions.append({
-                            "Date": f"{date_part}/{current_year}",
-                            "Description": f"Check #{check_num}",
-                            "Amount": -abs(amount), # Checks are withdrawals
-                            "Category": "Checks Paid",
-                            "Bank": "Wells Fargo"
-                        })
+                    matches = check_pattern.findall(line)
+                    if matches:
+                        for m in matches:
+                            check_num, amount_str, date_part = m
+                            amount = parse_amount(amount_str)
+                            
+                            transactions.append({
+                                "Date": f"{date_part}/{current_year}",
+                                "Description": f"Check #{check_num}",
+                                "Amount": -abs(amount), # Checks are withdrawals
+                                "Category": "Checks Paid",
+                                "Bank": "Wells Fargo"
+                            })
                         continue
 
                 # 4. MATCH STANDARD TRANSACTIONS
                 match = txn_pattern.match(line)
                 if match:
-                    date_part, amount_str, desc = match.groups()
+                    date_part_1, date_part_2, amount_str, desc = match.groups()
+                    
+                    # Use Posted Date (2nd date) if present, else 1st date
+                    date_part = date_part_2 if date_part_2 else date_part_1
+                    
                     amount = parse_amount(amount_str)
                     
                     # Apply Sign based on Section
@@ -182,8 +189,8 @@ def parse_wells_fargo_regex(pdf, current_year):
                 
                 # 5. HANDLE MULTI-LINE DESCRIPTIONS
                 elif transactions and len(line) > 0:
-                    # Don't append if we are in the checks section and missed a match (avoids junk)
-                    if current_section == "Checks Paid":
+                    # Don't append if we are in non-transaction sections
+                    if current_section in ["Checks Paid", "Balance History", "Footer"]:
                         continue
                         
                     is_summary = any(k in line_lower for k in ["total", "balance", "summary", "credits", "debits", "checks paid"])
