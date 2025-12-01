@@ -202,6 +202,7 @@ def parse_wells_fargo_spatial(pdf, current_year):
     Best for: Complex layouts where text extraction scrambles columns.
     """
     transactions = []
+    balances = []
     
     try:
         for page_num, page in enumerate(pdf.pages):
@@ -258,8 +259,11 @@ def parse_wells_fargo_spatial(pdf, current_year):
                                 amount = -abs(val)
                                 category = "Withdrawals"
                                 found_amount = True
-                            # Ignore Ending Balance column (usually x > 525)
-                        
+                            # Balance Zone: approx x > 515 (Running Balance)
+                            elif x >= 515:
+                                # Handled below
+                                pass 
+
                         # Build Description (words < 400 x)
                         if x < 400 and text != date_str:
                             description_parts.append(text)
@@ -273,6 +277,17 @@ def parse_wells_fargo_spatial(pdf, current_year):
                             "Bank": "Wells Fargo",
                             "Source_Strategy": "Spatial"
                         })
+                        
+                        # 2b. Look for Balance in the same line (Rightmost word)
+                        for w in line_words:
+                             if w['x0'] > 515 and re.match(r'^-?[\d,]+\.\d{2}$', w['text']):
+                                 b_val = parse_amount(w['text'])
+                                 balances.append({
+                                     "Date": f"{date_str}/{current_year}",
+                                     "Balance": b_val,
+                                     "Bank": "Wells Fargo"
+                                 })
+                                 break # Only one balance per line
                 
                 # Handle Multi-line Descriptions
                 elif transactions and not date_match:
@@ -290,7 +305,7 @@ def parse_wells_fargo_spatial(pdf, current_year):
     except Exception as e:
         print(f"Spatial strategy warning: {e}")
 
-    return transactions, [] # Returns empty balances list for compatibility
+    return transactions, balances
 
 # --- STRATEGY 4: WELLS FARGO MASTER SWITCH ---
 def parse_wells_fargo(pdf, current_year):
@@ -307,10 +322,10 @@ def parse_wells_fargo(pdf, current_year):
     # 2. Fallback to Spatial
     st.warning("Standard Regex found no transactions. Switching to Spatial Logic...")
     try:
-        txns, _ = parse_wells_fargo_spatial(pdf, current_year)
+        txns, bals = parse_wells_fargo_spatial(pdf, current_year)
         if txns:
             st.success(f"Spatial Logic Successful (Found {len(txns)} txns)")
-            return txns, bals # Return balances from regex (if any) or empty
+            return txns, bals
     except Exception as e:
         st.error(f"Spatial Logic Failed: {e}")
         
