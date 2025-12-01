@@ -4,7 +4,7 @@ import pandas as pd
 import re
 from collections import defaultdict
 
-st.set_page_config(page_title="Universal Bank Parser", layout="wide")
+st.set_page_config(page_title="Wells Fargo Parser", layout="wide")
 
 # --- UTILS ---
 def parse_amount(amount_str):
@@ -22,12 +22,8 @@ def identify_bank(text):
     text_lower = text.lower()
     if "wellsfargo.com" in text_lower:
         return "Wells Fargo"
-    if "chase" in text_lower and "jpmorgan" in text_lower:
-        return "Chase"
     if "wells fargo" in text_lower:
         return "Wells Fargo"
-    if "bank of america" in text_lower:
-        return "Bank of America"
     return "Unknown"
 
 def extract_year_from_header(text):
@@ -35,54 +31,20 @@ def extract_year_from_header(text):
     match = re.search(r'(20\d{2})', text)
     return match.group(1) if match else "2025"
 
-# --- STRATEGY 1: CHASE (REGEX / SECTIONS) ---
-def parse_chase(pdf, current_year):
-    transactions = []
-    balances = []
-    
-    # Chase-specific patterns
-    date_pattern = re.compile(r'^(\d{2}/\d{2})\s+(.*)\s+(-?\$?[\d,]+\.\d{2})$')
-    SECTION_KEYWORDS = ["DEPOSIT", "ADDITION", "WITHDRAWAL", "DEBIT", "FEE", "PAYMENT"]
-    
-    for page in pdf.pages:
-        text = page.extract_text(x_tolerance=2, y_tolerance=2)
-        if not text: continue
-        
-        lines = text.split('\n')
-        current_section = "Uncategorized"
-        
-        for line in lines:
-            line = line.strip()
-            upper_line = line.upper()
-            
-            # Detect Section
-            if (any(k in upper_line for k in SECTION_KEYWORDS) and "TOTAL" not in upper_line and len(line) < 80):
-                current_section = line.title()
-                continue
-                
-            # Parse Line
-            match = date_pattern.match(line)
-            if match:
-                date_part, desc, amount_str = match.groups()
-                amount = parse_amount(amount_str)
-                
-                # Logic: Section-based signing
-                sec_lower = current_section.lower()
-                if any(x in sec_lower for x in ['withdrawal', 'debit', 'fee', 'payment']):
-                    amount = -abs(amount)
-                elif any(x in sec_lower for x in ['deposit', 'add']):
-                    amount = abs(amount)
-                
-                transactions.append({
-                    "Date": f"{date_part}/{current_year}",
-                    "Description": desc.strip(),
-                    "Amount": amount,
-                    "Category": current_section,
-                    "Bank": "Chase"
-                })
-    return transactions, balances
+def extract_beginning_balance(text):
+    """Extracts beginning balance from the summary section."""
+    # Look for "Beginning balance" followed by currency
+    match = re.search(r'Beginning balance', text, re.IGNORECASE)
+    if match:
+        # Search in the text following the match
+        post_text = text[match.end():]
+        # Find first currency amount (allowing for newlines and spaces)
+        amount_match = re.search(r'\$\s?([\d,]+\.\d{2})', post_text)
+        if amount_match:
+            return parse_amount(amount_match.group(1))
+    return None
 
-# --- STRATEGY 2: WELLS FARGO (REGEX / STREAM) ---
+# --- STRATEGY 1: WELLS FARGO (REGEX / STREAM) ---
 def parse_wells_fargo_regex(pdf, current_year):
     """
     Parses Wells Fargo statements using Regex on text stream.
@@ -202,7 +164,7 @@ def parse_wells_fargo_regex(pdf, current_year):
         
     return transactions, balances
 
-# --- STRATEGY 3: WELLS FARGO (SPATIAL / X-COORDINATE) ---
+# --- STRATEGY 2: WELLS FARGO (SPATIAL / X-COORDINATE) ---
 def parse_wells_fargo_spatial(pdf, current_year):
     """
     Parses Wells Fargo statements using X-Coordinates.
@@ -314,7 +276,7 @@ def parse_wells_fargo_spatial(pdf, current_year):
 
     return transactions, balances
 
-# --- STRATEGY 4: WELLS FARGO MASTER SWITCH ---
+# --- STRATEGY 3: WELLS FARGO MASTER SWITCH ---
 def parse_wells_fargo(pdf, current_year):
     """
     Tries Regex strategy first. If no transactions found, switches to Spatial strategy.
@@ -338,67 +300,6 @@ def parse_wells_fargo(pdf, current_year):
         
     return [], []
 
-# --- STRATEGY 5: BANK OF AMERICA (BOA) ---
-def parse_boa(pdf):
-    transactions = []
-    balances = [] 
-    current_section = "Unknown"
-    
-    date_start_pattern = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+(.*?)(\-?[\d,]+\.\d{2})$')
-    check_pattern = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(?:(\d+\*?)\s+)?(\-?[\d,]+\.\d{2})')
-    
-    section_keywords = {
-        "Deposits and other credits": "Deposits",
-        "Withdrawals and other debits": "Withdrawals",
-        "Checks": "Checks",
-        "Service fees": "Service Fees",
-        "Daily ledger balances": "Ignore"
-    }
-
-    for page in pdf.pages:
-        text = page.extract_text()
-        if not text: continue
-        
-        lines = text.split('\n')
-        for line in lines:
-            section_found = False
-            for key, section_name in section_keywords.items():
-                if key in line:
-                    current_section = section_name
-                    section_found = True
-                    break
-            
-            if section_found or current_section == "Ignore":
-                continue
-
-            if current_section == "Checks":
-                matches = check_pattern.findall(line)
-                if matches:
-                    for m in matches:
-                        c_date, c_num, c_amt_str = m
-                        amount = parse_amount(c_amt_str)
-                        desc = f"Check #{c_num}" if c_num else "Check (No #)"
-                        transactions.append({
-                            "Date": c_date, 
-                            "Description": desc,
-                            "Amount": amount,
-                            "Category": "Checks",
-                            "Bank": "Bank of America"
-                        })
-            else:
-                match = date_start_pattern.match(line)
-                if match:
-                    date, desc, amount_str = match.groups()
-                    amount = parse_amount(amount_str)
-                    transactions.append({
-                        "Date": date,
-                        "Description": desc.strip(),
-                        "Amount": amount,
-                        "Category": current_section,
-                        "Bank": "Bank of America"
-                    })
-    return transactions, balances
-
 # --- MAIN ROUTER ---
 def process_pdf(pdf_file):
     try:
@@ -408,7 +309,7 @@ def process_pdf(pdf_file):
             
         with pdfplumber.open(pdf_file) as pdf:
             if not pdf.pages:
-                return [], []
+                return [], [], 0.0
                 
             # 1. Identify Bank & Year from Page 1
             first_page_text = pdf.pages[0].extract_text()
@@ -417,47 +318,61 @@ def process_pdf(pdf_file):
                 if len(pdf.pages) > 1:
                     first_page_text = pdf.pages[1].extract_text()
                 else:
-                    return [], []
+                    return [], [], 0.0
 
             bank_name = identify_bank(first_page_text)
             year = extract_year_from_header(first_page_text)
+            start_bal = extract_beginning_balance(first_page_text) or 0.0
             
             st.write(f"**Detected:** {bank_name} ({year})")
+            if start_bal:
+                st.write(f"**Beginning Balance:** ${start_bal:,.2f}")
             
             # 2. Route to Strategy
-            if bank_name == "Chase":
-                return parse_chase(pdf, year)
-            elif bank_name == "Wells Fargo":
-                return parse_wells_fargo(pdf, year)
-            elif bank_name == "Bank of America":
-                return parse_boa(pdf) 
+            if bank_name == "Wells Fargo":
+                txns, bals = parse_wells_fargo(pdf, year)
+                return txns, bals, start_bal
+            elif bank_name == "Unknown":
+                # If not explicitly identified but user uploaded it to this tool, we can try Wells Fargo by default or warn
+                 st.warning("Could not auto-detect Wells Fargo. Attempting Wells Fargo parser anyway...")
+                 txns, bals = parse_wells_fargo(pdf, year)
+                 return txns, bals, start_bal
             else:
-                st.error("Bank format not recognized (Supports: Chase, Wells Fargo, Bank of America)")
-                return [], []
+                st.error("Bank format not recognized (Only Wells Fargo supported)")
+                return [], [], 0.0
                 
     except Exception as e:
         # Log the error but don't crash the app; the UI loop will handle it
         raise e
 
 # --- UI ---
-st.title("🤖 Universal Bank Statement Parser")
-st.markdown("Automatically detects format and extracts structured data. Switches strategies if needed.")
+st.title("🤖 Wells Fargo Statement Parser")
+st.markdown("Automatically detects and extracts data from Wells Fargo PDF statements.")
 
-uploaded_files = st.file_uploader("Upload PDF Statements", type=['pdf'], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload Wells Fargo PDF Statements", type=['pdf'], accept_multiple_files=True)
 
 if uploaded_files:
     all_txns = []
     all_balances = []
+    file_start_bals = []
     
     for file in uploaded_files:
         with st.expander(f"Processing {file.name}", expanded=True):
             try:
                 with st.spinner(f"Parsing {file.name}..."):
-                    txns, bals = process_pdf(file)
+                    txns, bals, s_bal = process_pdf(file)
                     
                     if txns:
                         all_txns.extend(txns)
                         st.success(f"Extracted {len(txns)} transactions")
+                        
+                        # Track start balance with the earliest transaction date in this file
+                        # We need to temporarily parse dates to find the min
+                        temp_dates = [pd.to_datetime(t['Date'], errors='coerce') for t in txns]
+                        valid_dates = [d for d in temp_dates if pd.notnull(d)]
+                        if valid_dates:
+                             min_date = min(valid_dates)
+                             file_start_bals.append({'date': min_date, 'balance': s_bal})
                     else:
                         st.warning(f"No transactions found in {file.name}.")
                     
@@ -508,7 +423,7 @@ if uploaded_files:
         st.download_button(
             "Download CSV",
             csv,
-            "universal_bank_export.csv",
+            "wells_fargo_export.csv",
             "text/csv",
             key='download-csv'
         )
@@ -522,4 +437,57 @@ if uploaded_files:
         bal_df['Date'] = pd.to_datetime(bal_df['Date'], errors='coerce')
         bal_df.sort_values('Date', inplace=True)
         
-        st.dataframe(bal_df, use_container_width=True)
+        # Compute Running Balance logic
+        if all_txns:
+             # 1. Determine Global Start Balance
+             global_start_bal = 0.0
+             if file_start_bals:
+                 # Sort by date
+                 file_start_bals.sort(key=lambda x: x['date'])
+                 global_start_bal = file_start_bals[0]['balance']
+             
+             st.caption(f"Computed columns based on detected Beginning Balance: **${global_start_bal:,.2f}**")
+
+             # 2. Aggregate Transactions by Day
+             txn_df = pd.DataFrame(all_txns)
+             txn_df['Date'] = pd.to_datetime(txn_df['Date'], errors='coerce')
+             
+             # Sum amount per day
+             daily_change = txn_df.groupby('Date')['Amount'].sum().reset_index()
+             daily_change.sort_values('Date', inplace=True)
+             
+             # 3. Calculate Running Balance
+             daily_change['Computed Balance'] = global_start_bal + daily_change['Amount'].cumsum()
+             
+             # 4. Merge with Extracted Balances
+             # We merge on Date. 
+             merged_df = pd.merge(bal_df, daily_change[['Date', 'Computed Balance']], on='Date', how='outer')
+             merged_df.sort_values('Date', inplace=True)
+             
+             # Fill forward the computed balance (balance doesn't change on days with no txns)
+             merged_df['Computed Balance'] = merged_df['Computed Balance'].ffill()
+             # If starts with NaN (dates before first txn), fill with global start
+             merged_df['Computed Balance'] = merged_df['Computed Balance'].fillna(global_start_bal)
+             
+             # Fill extracted balance NaNs with None/NaN or leave as is?
+             # The user wants to compare.
+             
+             # Calculate Difference (only where we have extracted balance)
+             merged_df['Difference'] = merged_df['Balance'] - merged_df['Computed Balance']
+             
+             # Formatting for display
+             # Only show relevant columns
+             display_cols = ['Date', 'Balance', 'Computed Balance', 'Difference']
+             
+             # Highlight differences
+             def highlight_diff(row):
+                 try:
+                     if pd.notnull(row['Difference']) and abs(row['Difference']) > 0.01:
+                         return ['background-color: #ffcccc'] * len(row)
+                 except: pass
+                 return [''] * len(row)
+
+             st.dataframe(merged_df[display_cols].style.apply(highlight_diff, axis=1).format("{:.2f}", subset=['Balance', 'Computed Balance', 'Difference']), use_container_width=True)
+             
+        else:
+            st.dataframe(bal_df, use_container_width=True)
