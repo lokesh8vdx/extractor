@@ -3,6 +3,7 @@ import pdfplumber
 import pandas as pd
 import re
 import io
+from collections import Counter
 
 st.set_page_config(page_title="No-AI Bank Extractor", layout="wide")
 
@@ -139,7 +140,31 @@ def extract_chase_transactions(pdf_file):
                                     date = f"{last_month}{date}"
                                 else:
                                     date = f"04{date}" # Fallback
-                            
+                            else:
+                                # Fix corrupted dates where month is wrong (e.g. "2/10" instead of "04/10")
+                                # This happens when noise (like "balance2/10") is parsed as date
+                                parts = date.split('/')
+                                if len(parts) == 2:
+                                    m, d = parts
+                                    # Determine context month from previous balances or transactions
+                                    context_months = []
+                                    if balances:
+                                        context_months.extend([b['Date'].split('/')[0] for b in balances])
+                                    elif transactions:
+                                        context_months.extend([t['Date'].split('/')[0] for t in transactions])
+                                    
+                                    if context_months:
+                                        try:
+                                            common_month = Counter(context_months).most_common(1)[0][0]
+                                            m_int = int(m)
+                                            cm_int = int(common_month)
+                                            # If diff > 1 month (ignoring Jan/Dec wrap), it's likely noise
+                                            diff = abs(m_int - cm_int)
+                                            if diff > 1 and diff != 11: 
+                                                date = f"{common_month}/{d}"
+                                        except (ValueError, IndexError):
+                                            pass
+
                             amount = parse_amount(amount_str)
                             balances.append({
                                 "Date": date,
