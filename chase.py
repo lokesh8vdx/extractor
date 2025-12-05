@@ -286,9 +286,17 @@ def extract_chase_transactions(pdf_file):
                     if "$" in line and "Balance" in line:
                         continue
 
+                    # Clean debug markers from the line (e.g. *end*deposits and additions ...)
+                    # Only remove the marker and the section name, keeping potential transaction text
+                    if "*start*" in line or "*end*" in line:
+                        # Regex to remove *start/end* followed by text, but careful not to eat transaction info
+                        # Matches *tag* followed by non-digits until a digit or end of line
+                        line = re.sub(r'\*(?:start|end)\*[^\d]+', '', line).strip()
+                        if not line:
+                            continue
+
                     # Skip potential header/footer junk and noise markers
-                    if "*start*" in line or "*end*" in line or \
-                       "DATE DESCRIPTION" in line or \
+                    if "DATE DESCRIPTION" in line or \
                        "Account Number" in line or \
                        re.match(r'^[\d\s]+$', line) or \
                        ("through" in line and re.search(r'\d{4}', line)):
