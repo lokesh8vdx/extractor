@@ -27,6 +27,32 @@ def parse_bank_statement(pdf_file):
     # 2. Specific Check Pattern: Date | Optional Check # | Amount
     check_pattern = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(?:(\d+\*?)\s+)?(\-?[\d,]+\.\d{2})')
     
+    # Patterns to ignore (Headers, Footers, Page Info)
+    ignore_patterns = [
+        r'^Date\s+Description\s+Amount',
+        r'^Page\s+\d+\s+of\s+\d+',
+        r'^continued\s+on\s+the\s+next\s+page',
+        r'^Account\s+#',
+        r'^Bank\s+of\s+America',
+        r'^Your\s+checking\s+account',
+        r'^Total\s+', 
+        r'^©\d{4}',
+        r'^Mobile\s+Banking',
+        r'^Message\s+and\s+data',
+        r'^Fees\s+or\s+other',
+        r'^See\s+the\s+big\s+picture',
+        r'^Scan\s+the\s+code',
+        r'^Use\s+our\s+app',
+        r'^When\s+you\s+use',
+        r'^Available\s+in\s+',
+        r'^Send\s+wire\s+transfers',
+        r'^Data\s+connection\s+required',
+        r'^To\s+learn\s+more',
+        r'^Subtotal\s+',
+        r'^Note\s+your\s+Ending\s+Balance'
+    ]
+    ignore_regex = re.compile('|'.join(ignore_patterns), re.IGNORECASE)
+    
     # Summary Patterns
     # Updated to handle potential negative signs and optional dollar signs for all fields
     # (?:-)? matches an optional negative sign
@@ -76,16 +102,31 @@ def parse_bank_statement(pdf_file):
 
             lines = text.split('\n')
             
+            # Reset last transaction index for the new page 
+            last_txn_index = None
+            
             for line in lines:
                 # --- 1. Detect Section Change ---
                 section_found = False
                 for key, section_name in section_keywords.items():
+                    # Check if the line *starts with* or acts as a clear header to avoid false positives in descriptions
+                    # Original code was 'if key in line'. Kept simple but added length check to avoid partial matches if needed.
+                    # However, strictly sticking to original logic for section detection to avoid regressions, 
+                    # but we must ensure we don't append section headers to descriptions.
                     if key in line:
                         current_section = section_name
                         section_found = True
+                        last_txn_index = None # Reset context
                         break
                 
                 if section_found or current_section == "Ignore":
+                    continue
+                
+                # Check for Footer/Noise lines
+                if ignore_regex.search(line):
+                    # If we hit a footer/header/noise line, assume the previous transaction's 
+                    # multi-line description has ended.
+                    last_txn_index = None 
                     continue
 
                 # --- 2. Parse Based on Section Type ---
@@ -117,6 +158,8 @@ def parse_bank_statement(pdf_file):
                                 "Type": current_section,
                                 "Source_Page": page.page_number
                             })
+                        # Reset index because checks don't typically have continuation lines in this layout
+                        last_txn_index = None 
                             
                 # LOGIC FOR DEPOSITS, WITHDRAWALS, FEES (Single Column / General)
                 else:
@@ -138,6 +181,17 @@ def parse_bank_statement(pdf_file):
                             "Type": current_section,
                             "Source_Page": page.page_number
                         })
+                        # Track this transaction for potential multi-line descriptions
+                        last_txn_index = len(transactions) - 1
+                    
+                    else:
+                        # --- Handle Multi-line Descriptions ---
+                        # If it's not a new transaction (no date match), 
+                        # check if we should append this line to the previous transaction.
+                        if last_txn_index is not None and current_section in ["Deposits", "Withdrawals", "Service Fees"]:
+                            clean_line = line.strip()
+                            if clean_line:
+                                transactions[last_txn_index]["Description"] += " " + clean_line
             
             # Update progress
             progress_bar.progress((idx + 1) / total_pages)
