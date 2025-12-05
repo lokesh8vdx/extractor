@@ -352,9 +352,11 @@ if uploaded_file:
                 
                 # Download Buttons
                 col1, col2 = st.columns(2)
-                csv = df.to_csv(index=False).encode('utf-8')
+                # Use the sorted DataFrame for downloads
+                csv = display_txns.to_csv(index=False).encode('utf-8')
                 col1.download_button("Download as CSV", csv, "boa_transactions.csv", "text/csv", key='download-csv')
-                json_str = df.to_json(orient="records", indent=4)
+                
+                json_str = display_txns.to_json(orient="records", indent=4)
                 col2.download_button("Download as JSON", json_str, "boa_transactions.json", "application/json", key='download-json')
                 
             else:
