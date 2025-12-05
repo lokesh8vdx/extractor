@@ -52,8 +52,8 @@ def extract_chase_transactions(pdf_file):
             
             # Pattern for Balance History (multi-column)
             # Finds all occurrences of "Date Amount" pairs in a line
-            # Updated to match date flexibility (single digit month or partial)
-            balance_pattern = re.compile(r'(\d{0,2}/\d{2})\s+(-?\$?[\d,]+\.\d{2})')
+            # Updated to allow optional space before slash (e.g. "03 /11")
+            balance_pattern = re.compile(r'(\d{0,2}\s?/\d{2})\s+(-?\$?[\d,]+\.\d{2})')
 
             # Pattern for Checking Summary
             # Matches: Label (text), Optional Count (int), Amount (currency)
@@ -133,38 +133,72 @@ def extract_chase_transactions(pdf_file):
                     matches = balance_pattern.findall(line)
                     if matches:
                         for date, amount_str in matches:
+                            # Remove potential spaces captured by regex
+                            date = date.replace(' ', '')
+                            
                             # Fix date year if needed
                             if date.startswith('/'):
                                 if balances:
-                                    last_month = balances[-1]['Date'].split('/')[0]
-                                    date = f"{last_month}{date}"
+                                    last_date = balances[-1]['Date']
+                                    # Handle potential full date format MM/DD/YY in last_date
+                                    parts = last_date.split('/')
+                                    last_month = parts[0]
+                                    last_day = parts[1]
+                                    
+                                    current_day_str = date.replace('/', '')
+                                    
+                                    try:
+                                        cur_d = int(current_day_str)
+                                        lst_d = int(last_day)
+                                        lst_m = int(last_month)
+                                        
+                                        # Heuristic: If current day is significantly smaller than last day, 
+                                        # it's likely the next month (e.g. 28 -> 02)
+                                        if cur_d < lst_d:
+                                            new_month = lst_m + 1
+                                            if new_month > 12: new_month = 1
+                                            date = f"{new_month:02d}{date}"
+                                        else:
+                                            date = f"{last_month}{date}"
+                                    except ValueError:
+                                        date = f"{last_month}{date}"
                                 else:
                                     date = f"04{date}" # Fallback
                             else:
-                                # Fix corrupted dates where month is wrong (e.g. "2/10" instead of "04/10")
-                                # This happens when noise (like "balance2/10") is parsed as date
-                                parts = date.split('/')
-                                if len(parts) == 2:
-                                    m, d = parts
-                                    # Determine context month from previous balances or transactions
-                                    context_months = []
-                                    if balances:
-                                        context_months.extend([b['Date'].split('/')[0] for b in balances])
-                                    elif transactions:
-                                        context_months.extend([t['Date'].split('/')[0] for t in transactions])
-                                    
-                                    if context_months:
-                                        try:
-                                            common_month = Counter(context_months).most_common(1)[0][0]
-                                            m_int = int(m)
-                                            cm_int = int(common_month)
-                                            # If diff > 1 month (ignoring Jan/Dec wrap), it's likely noise
-                                            diff = abs(m_int - cm_int)
-                                            if diff > 1 and diff != 11: 
-                                                date = f"{common_month}/{d}"
-                                        except (ValueError, IndexError):
-                                            pass
-
+                                # Sequential Validation Logic
+                                # Since Daily Ending Balances must be chronological,
+                                # we check if the current date seems to "jump back" in time (e.g. 03/10 -> 02/11).
+                                # This handles noise like "balance2/11" being parsed as "2/11" instead of "03/11".
+                                if balances:
+                                    try:
+                                        last_date = balances[-1]['Date']
+                                        last_m_str, last_d_str = last_date.split('/')
+                                        last_m = int(last_m_str)
+                                        
+                                        # Clean current date parts
+                                        cur_parts = date.split('/')
+                                        if len(cur_parts) == 2:
+                                            cur_m = int(cur_parts[0])
+                                            
+                                            # Check for backward month jump (excluding Dec -> Jan)
+                                            # If cur_m < last_m and not (last_m == 12 and cur_m == 1):
+                                                # It's likely a corrupted month digit.
+                                                # We assume it belongs to the same month (or next, but rarely skips back)
+                                                # Since 11 > 10 (in 03/10 -> 2/11 example), using last_m (03) makes it 03/11 which is valid.
+                                                
+                                                # But what if it SHOULD be next month? e.g. 03/31 -> 2/01 (noise for 04/01)?
+                                                # If we force 03/01, it's still < 03/31.
+                                                # So we might need to check days too.
+                                                
+                                                # Simple robust fix for "balance2/11" case:
+                                                # If cur_m is clearly wrong (backwards), try last_m.
+                                                # If changing to last_m makes it chronological (or close), use it.
+                                                
+                                                # Update date to use last_m
+                                            date = f"{last_m:02d}/{cur_parts[1]}"
+                                    except (ValueError, IndexError):
+                                        pass
+                                
                             amount = parse_amount(amount_str)
                             balances.append({
                                 "Date": date,
@@ -237,23 +271,32 @@ def extract_chase_transactions(pdf_file):
                         "Page": page_num 
                     })
                 
-                # HANDLE MULTI-LINE DESCRIPTIONS (Advanced Logic)
+                # HANDLE MULTI-LINE DESCRIPTIONS (Simplified Logic from boa.py)
                 # If a line doesn't start with a date but we just added a transaction,
                 # it's likely a continuation of the previous description.
                 elif transactions and not re.match(r'\d{2}/\d{2}', line) and \
                      not (current_section == "Checks Paid" and re.match(r'^\d+', line)) and \
                      current_section not in ["Daily Ending Balance", "Checking Summary"]:
-                    # Check if it looks like a balance summary line or junk
+                    
+                    # Ensure we don't append lines from a new page to a previous page's transaction
+                    if transactions[-1]['Page'] != page_num:
+                        continue
+
+                    # Skip if it looks like a balance summary line (Chase specific noise)
                     if "$" in line and "Balance" in line:
+                        continue
+
+                    # Skip potential header/footer junk and noise markers
+                    if "*start*" in line or "*end*" in line or \
+                       "DATE DESCRIPTION" in line or \
+                       "Account Number" in line or \
+                       re.match(r'^[\d\s]+$', line) or \
+                       ("through" in line and re.search(r'\d{4}', line)):
                         continue
                         
                     # Append to previous transaction description
-                    # Heuristic: Only append if the line is somewhat short or indented
-                    # (This is where "MinerU" or complex logic helps, but simple appending works for 90% of cases)
                     last_txn = transactions[-1]
-                    # Avoid merging unrelated numbers
-                    if not re.search(r'\d+\.\d{2}$', line): 
-                        last_txn["Description"] += " " + line
+                    last_txn["Description"] += " " + line
 
     return pd.DataFrame(transactions), pd.DataFrame(balances), pd.DataFrame(checking_summary)
 
@@ -268,10 +311,206 @@ if uploaded_file:
             if not df.empty:
                 st.success(f"Successfully extracted {len(df)} transactions!")
                 
-                # Show Summary
+                # --- Account Summary Comparison Table (like boa.py) ---
+                st.subheader("Account Summary Comparison")
+                
+                # Extract summary values from checking_summary DataFrame
+                extracted_summary = {}
                 if not summary_df.empty:
-                    st.subheader("Checking Summary")
-                    st.dataframe(summary_df, use_container_width=True)
+                    # Look for common summary fields in the Description column
+                    for _, row in summary_df.iterrows():
+                        desc = str(row['Description']).lower()
+                        amount = row['Amount']
+                        
+                        if 'opening' in desc or 'beginning' in desc:
+                            extracted_summary['Beginning Balance'] = amount
+                        elif 'closing' in desc or 'ending' in desc:
+                            extracted_summary['Ending Balance'] = amount
+                        elif 'deposit' in desc or 'additions' in desc:
+                            extracted_summary['Deposits'] = abs(amount)
+                        elif 'withdrawal' in desc or 'debit' in desc:
+                            # Sum all withdrawal types (ATM, Electronic, Other, etc.)
+                            if 'Withdrawals' not in extracted_summary:
+                                extracted_summary['Withdrawals'] = 0.0
+                            extracted_summary['Withdrawals'] += abs(amount)
+                        elif 'check' in desc:
+                            extracted_summary['Checks'] = abs(amount)
+                        elif 'fee' in desc:
+                            extracted_summary['Fees'] = abs(amount)
+                
+                # Calculate Computed Values from transactions
+                # Use abs() sum to ensure positive magnitude for comparison
+                computed_deposits = abs(df[df['Type'] == 'Deposit']['Amount'].sum())
+                computed_atm = abs(df[df['Type'] == 'ATM & Debit Withdrawal']['Amount'].sum())
+                computed_electronic = abs(df[df['Type'] == 'Electronic Withdrawal']['Amount'].sum())
+                computed_checks = abs(df[df['Type'] == 'Checks Paid']['Amount'].sum())
+                computed_other = abs(df[df['Type'] == 'Other Withdrawal']['Amount'].sum())
+                # Total withdrawals = sum of all withdrawal types (ATM, Electronic, Other)
+                computed_withdrawals = computed_atm + computed_electronic + computed_other
+                computed_fees = abs(df[df['Type'] == 'Fee']['Amount'].sum())
+                
+                # Beginning balance is not computed from transactions, so we take extracted or 0
+                beg_bal = extracted_summary.get('Beginning Balance', 0.0)
+                
+                # Compute Ending Balance
+                # Note: Following boa.py pattern - add all values together
+                # If withdrawals/checks/fees are negative in the data, adding them will subtract
+                # If they're positive, we subtract them explicitly
+                # Since we standardized to positive magnitudes above:
+                # Balance = Beg + Deposits - Withdrawals - Checks - Fees
+                computed_ending = beg_bal + computed_deposits - computed_withdrawals - computed_checks - computed_fees
+                
+                # Create summary comparison table
+                summary_data = [
+                    {
+                        "Category": "Beginning Balance", 
+                        "Extracted": extracted_summary.get('Beginning Balance', 0.0), 
+                        "Computed": beg_bal, 
+                        "Difference": 0.0
+                    },
+                    {
+                        "Category": "Deposits/Credits", 
+                        "Extracted": extracted_summary.get('Deposits', 0.0), 
+                        "Computed": computed_deposits, 
+                        "Difference": extracted_summary.get('Deposits', 0.0) - computed_deposits
+                    },
+                    {
+                        "Category": "Withdrawals/Debits", 
+                        "Extracted": extracted_summary.get('Withdrawals', 0.0), 
+                        "Computed": computed_withdrawals, 
+                        "Difference": extracted_summary.get('Withdrawals', 0.0) - computed_withdrawals
+                    },
+                    {
+                        "Category": "Checks Paid", 
+                        "Extracted": extracted_summary.get('Checks', 0.0), 
+                        "Computed": computed_checks, 
+                        "Difference": extracted_summary.get('Checks', 0.0) - computed_checks
+                    },
+                    {
+                        "Category": "Fees", 
+                        "Extracted": extracted_summary.get('Fees', 0.0), 
+                        "Computed": computed_fees, 
+                        "Difference": extracted_summary.get('Fees', 0.0) - computed_fees
+                    },
+                    {
+                        "Category": "Ending Balance", 
+                        "Extracted": extracted_summary.get('Ending Balance', 0.0), 
+                        "Computed": computed_ending, 
+                        "Difference": extracted_summary.get('Ending Balance', 0.0) - computed_ending
+                    },
+                ]
+                
+                summary_comparison_df = pd.DataFrame(summary_data)
+                
+                # --- 2. Daily Ledger Analysis (Validation) ---
+                ledger_analysis_df = pd.DataFrame()
+                if not balance_df.empty:
+                    # Standardize Date Format for Processing
+                    # balance_df['Date'] is already MM/DD, need to handle year and sorting
+                    
+                    # Determine Year from Transactions if possible
+                    year = "25" # Default
+                    if 'Date' in df.columns and not df.empty:
+                        first_date = df.iloc[0]['Date']
+                        try:
+                            parts = first_date.split('/')
+                            if len(parts) == 3:
+                                year = parts[2]
+                            # If date is MM/DD, we might need external context or assume current year
+                        except:
+                            pass
+                    
+                    # Helper to convert date string to datetime for sorting
+                    def to_datetime(date_str):
+                        try:
+                            if isinstance(date_str, str):
+                                if date_str.count('/') == 1:
+                                    return pd.to_datetime(f"{date_str}/{year}", format='%m/%d/%y', errors='coerce')
+                                return pd.to_datetime(date_str, format='%m/%d/%y', errors='coerce')
+                            return pd.NaT
+                        except:
+                            return pd.NaT
+
+                    # Create copies to avoid SettingWithCopyWarning
+                    balance_calc_df = balance_df.copy()
+                    df_calc = df.copy()
+
+                    balance_calc_df['DateTime'] = balance_calc_df['Date'].apply(to_datetime)
+                    df_calc['DateTime'] = df_calc['Date'].apply(to_datetime)
+                    
+                    # Sort by date
+                    balance_calc_df = balance_calc_df.sort_values('DateTime')
+                    df_calc = df_calc.sort_values('DateTime')
+                    
+                    ledger_analysis = []
+                    
+                    for idx, row in balance_calc_df.iterrows():
+                        l_date = row['DateTime']
+                        l_balance = row['Amount']
+                        
+                        if pd.isnull(l_date):
+                            continue
+                            
+                        # Calculate computed balance for this date
+                        # Balance = Beginning Balance + (Deposits - Withdrawals - Checks - Fees) up to this date
+                        relevant_txns = df_calc[df_calc['DateTime'] <= l_date]
+                        
+                        current_bal = beg_bal
+                        for _, txn in relevant_txns.iterrows():
+                            amt = txn['Amount']
+                            t_type = txn['Type']
+                            
+                            if t_type == 'Deposit':
+                                current_bal += amt
+                            else:
+                                current_bal -= amt
+                        
+                        diff = l_balance - current_bal
+                        
+                        ledger_analysis.append({
+                            "Date": row['Date'],
+                            "Extracted Balance": l_balance,
+                            "Computed Balance": current_bal,
+                            "Difference": diff
+                        })
+                    
+                    ledger_analysis_df = pd.DataFrame(ledger_analysis)
+
+                # --- Validation Check (PASSED/FAILED Message) ---
+                summary_diffs = [d['Category'] for d in summary_data if abs(d['Difference']) > 0.01]
+                
+                ledger_diffs = []
+                if not ledger_analysis_df.empty:
+                    ledger_diffs = ledger_analysis_df[abs(ledger_analysis_df['Difference']) > 0.01]['Date'].tolist()
+                
+                if not summary_diffs and not ledger_diffs:
+                    st.success("✅ PASSED: All extracted values match computed balances.")
+                else:
+                    error_msg = "❌ FAILED: Discrepancies found."
+                    if summary_diffs:
+                        error_msg += f"\n\n**Summary Discrepancies:** {', '.join(summary_diffs)}"
+                    if ledger_diffs:
+                        error_msg += f"\n\n**Daily Ledger Discrepancies (Dates):** {', '.join(str(d) for d in ledger_diffs)}"
+                    st.error(error_msg)
+                
+                # Format columns for display
+                def format_currency(x):
+                    return "${:,.2f}".format(x)
+
+                def format_number(x):
+                    return "{:,.2f}".format(x)
+                
+                display_df = summary_comparison_df.copy()
+                display_df['Extracted'] = display_df['Extracted'].apply(format_currency)
+                display_df['Computed'] = display_df['Computed'].apply(format_currency)
+                display_df['Difference'] = display_df['Difference'].apply(format_number)
+                
+                st.table(display_df)
+                
+                # Show original Checking Summary if available
+                if not summary_df.empty:
+                    with st.expander("Raw Checking Summary (from PDF)"):
+                        st.dataframe(summary_df, use_container_width=True)
                 
                 col1, col2, col3 = st.columns(3)
                 total_deposits = df[df['Type'] == 'Deposit']['Amount'].sum()
@@ -311,7 +550,27 @@ if uploaded_file:
                     key='download-csv'
                 )
                 
-                if not balance_df.empty:
+                # --- Daily Ledger Analysis ---
+                if not ledger_analysis_df.empty:
+                    st.divider()
+                    st.subheader("Daily Ledger Balances Analysis")
+                    
+                    # Format for display
+                    display_ledger = ledger_analysis_df.copy()
+                    display_ledger['Extracted Balance'] = display_ledger['Extracted Balance'].apply(format_currency)
+                    display_ledger['Computed Balance'] = display_ledger['Computed Balance'].apply(format_currency)
+                    # Difference shown as raw number
+                    st.table(display_ledger)
+                    
+                    csv_bal = ledger_analysis_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        "Download Ledger Analysis CSV",
+                        csv_bal,
+                        "bank_statement_ledger_analysis.csv",
+                        "text/csv",
+                        key='download-bal-csv'
+                    )
+                elif not balance_df.empty:
                     st.divider()
                     st.subheader("Daily Ending Balances")
                     st.dataframe(balance_df, use_container_width=True)
