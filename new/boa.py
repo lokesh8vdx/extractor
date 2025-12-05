@@ -15,23 +15,32 @@ It handles standard sections, **multi-column check tables**, and **missing check
 def parse_bank_statement(pdf_file):
     """
     Extracts structured transaction data from the Bank of America PDF statement.
+    Also extracts the Account Summary from the first page.
     """
     transactions = []
     current_section = "Unknown"
+    extracted_summary = {}
     
     # 1. General Pattern: Date at start, Description in middle, Amount at end
     date_start_pattern = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+(.*?)(\-?[\d,]+\.\d{2})$')
     
     # 2. Specific Check Pattern: Date | Optional Check # | Amount
-    # Explanation:
-    # (\d{2}/\d{2}/\d{2})       -> Capture Group 1: Date (MM/DD/YY)
-    # \s+                       -> Required whitespace
-    # (?:(\d+\*?)\s+)?          -> Non-capturing optional group for Check #:
-    #     (\d+\*?)              -> Capture Group 2: Digits and optional '*' (e.g., "1331*")
-    #     \s+                   -> Space after check number
-    # (\-?[\d,]+\.\d{2})        -> Capture Group 3: Amount (e.g., "-366.00" or "2,000.00")
     check_pattern = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(?:(\d+\*?)\s+)?(\-?[\d,]+\.\d{2})')
     
+    # Summary Patterns
+    # Updated to handle potential negative signs and optional dollar signs for all fields
+    # (?:-)? matches an optional negative sign
+    # \$? matches an optional dollar sign
+    # [\d,]+\.\d{2} matches the amount
+    summary_patterns = {
+        "Beginning Balance": re.compile(r"Beginning balance on .*? ((?:-)?\$?[\d,]+\.\d{2})"),
+        "Deposits/Credits": re.compile(r"Deposits and other credits\s+((?:-)?\$?[\d,]+\.\d{2})"),
+        "Withdrawals/Debits": re.compile(r"Withdrawals and other debits\s+((?:-)?\$?[\d,]+\.\d{2})"),
+        "Checks": re.compile(r"Checks\s+((?:-)?\$?[\d,]+\.\d{2})"),
+        "Service Fees": re.compile(r"Service fees\s+((?:-)?\$?[\d,]+\.\d{2})"),
+        "Ending Balance": re.compile(r"Ending balance on .*? ((?:-)?\$?[\d,]+\.\d{2})")
+    }
+
     # Sections keywords to switch context
     section_keywords = {
         "Deposits and other credits": "Deposits",
@@ -53,6 +62,18 @@ def parse_bank_statement(pdf_file):
             if not text:
                 continue
             
+            # --- Extract Summary from First Page ---
+            if idx == 0:
+                for key, pattern in summary_patterns.items():
+                    match = pattern.search(text)
+                    if match:
+                        try:
+                            val_str = match.group(1).replace('$', '').replace(',', '')
+                            val = float(val_str)
+                            extracted_summary[key] = val
+                        except ValueError:
+                            extracted_summary[key] = 0.0
+
             lines = text.split('\n')
             
             for line in lines:
@@ -71,8 +92,6 @@ def parse_bank_statement(pdf_file):
                 
                 # LOGIC FOR CHECKS (Multi-Column & Optional Check #)
                 if current_section == "Checks":
-                    # findall returns a list of tuples: 
-                    # e.g. [('04/08/25', '', '-366.00'), ('04/10/25', '120', '-2,000.00')]
                     matches = check_pattern.findall(line)
                     
                     if matches:
@@ -81,7 +100,6 @@ def parse_bank_statement(pdf_file):
                             c_num = m[1]
                             c_amt_str = m[2].replace(',', '')
                             
-                            # Handle description based on whether Check # exists
                             if c_num:
                                 c_desc = f"Check #{c_num}"
                             else:
@@ -127,7 +145,7 @@ def parse_bank_statement(pdf_file):
         progress_bar.empty()
         status_text.empty()
 
-    return pd.DataFrame(transactions)
+    return pd.DataFrame(transactions), extracted_summary
 
 # --- UI ---
 uploaded_file = st.file_uploader("Upload Bank of America PDF Statement", type=['pdf'])
@@ -137,7 +155,7 @@ if uploaded_file:
         try:
             # Create a file-like object from uploaded file
             pdf_file = io.BytesIO(uploaded_file.read())
-            df = parse_bank_statement(pdf_file)
+            df, extracted_summary = parse_bank_statement(pdf_file)
             
             # Filtering out 'Unknown' and 'Ignore' types
             df = df[~df['Type'].isin(['Unknown', 'Ignore'])]
@@ -145,19 +163,52 @@ if uploaded_file:
             if not df.empty:
                 st.success(f"Successfully extracted {len(df)} transactions!")
                 
-                # Show Summary
+                # --- Account Summary Table ---
+                st.subheader("Account Summary Comparison")
+                
+                # Calculate Computed Values
+                computed_deposits = df[df['Type'] == 'Deposits']['Amount'].sum()
+                computed_withdrawals = df[df['Type'] == 'Withdrawals']['Amount'].sum()
+                computed_checks = df[df['Type'] == 'Checks']['Amount'].sum()
+                computed_fees = df[df['Type'] == 'Service Fees']['Amount'].sum()
+                
+                # Beginning balance is not computed from transactions, so we take extracted or 0
+                beg_bal = extracted_summary.get("Beginning Balance", 0.0)
+                
+                # Compute Ending Balance
+                # Note: Withdrawals, Checks, Fees are usually negative in the DF if parsed correctly as negative numbers.
+                # Based on the regex (r'(\-?[\d,]+\.\d{2})'), they capture the negative sign.
+                computed_ending = beg_bal + computed_deposits + computed_withdrawals + computed_checks + computed_fees
+                
+                summary_data = [
+                    {"Category": "Beginning Balance", "Extracted": extracted_summary.get("Beginning Balance", 0.0), "Computed": beg_bal, "Difference": 0.0},
+                    {"Category": "Deposits/Credits", "Extracted": extracted_summary.get("Deposits/Credits", 0.0), "Computed": computed_deposits, "Difference": extracted_summary.get("Deposits/Credits", 0.0) - computed_deposits},
+                    {"Category": "Withdrawals/Debits", "Extracted": extracted_summary.get("Withdrawals/Debits", 0.0), "Computed": computed_withdrawals, "Difference": extracted_summary.get("Withdrawals/Debits", 0.0) - computed_withdrawals},
+                    {"Category": "Checks", "Extracted": extracted_summary.get("Checks", 0.0), "Computed": computed_checks, "Difference": extracted_summary.get("Checks", 0.0) - computed_checks},
+                    {"Category": "Service Fees", "Extracted": extracted_summary.get("Service Fees", 0.0), "Computed": computed_fees, "Difference": extracted_summary.get("Service Fees", 0.0) - computed_fees},
+                    {"Category": "Ending Balance", "Extracted": extracted_summary.get("Ending Balance", 0.0), "Computed": computed_ending, "Difference": extracted_summary.get("Ending Balance", 0.0) - computed_ending},
+                ]
+                
+                summary_df = pd.DataFrame(summary_data)
+                
+                # Format columns for display
+                def format_currency(x):
+                    return "${:,.2f}".format(x)
+                
+                display_df = summary_df.copy()
+                display_df['Extracted'] = display_df['Extracted'].apply(format_currency)
+                display_df['Computed'] = display_df['Computed'].apply(format_currency)
+                display_df['Difference'] = display_df['Difference'].apply(format_currency)
+                
+                st.table(display_df)
+                
+                # --- Transaction Metrics ---
                 col1, col2, col3, col4 = st.columns(4)
                 
-                # Checks are usually negative in statement data, but we sum absolute for display
-                total_deposits = df[df['Type'] == 'Deposits']['Amount'].sum()
-                total_withdrawals = df[df['Type'] == 'Withdrawals']['Amount'].sum()
-                total_checks = df[df['Type'] == 'Checks']['Amount'].sum()
-                total_fees = df[df['Type'] == 'Service Fees']['Amount'].sum()
-                
-                col1.metric("Total Deposits", f"${total_deposits:,.2f}")
-                col2.metric("Total Withdrawals", f"${total_withdrawals:,.2f}")
-                col3.metric("Total Checks", f"${total_checks:,.2f}")
-                col4.metric("Total Fees", f"${total_fees:,.2f}")
+                col1.metric("Total Deposits", f"${computed_deposits:,.2f}")
+                col2.metric("Total Withdrawals", f"${computed_withdrawals:,.2f}")
+                col3.metric("Total Checks", f"${computed_checks:,.2f}")
+                col4.metric("Total Fees", f"${computed_fees:,.2f}")
                 
                 # Data Grid
                 st.subheader("Transaction Details")
