@@ -327,7 +327,17 @@ if uploaded_file:
                 
                 # Data Grid
                 st.subheader("Transaction Details")
-                st.dataframe(df, use_container_width=True, height=400)
+                # Ensure DateTime column exists and sort
+                if 'DateTime' not in df.columns:
+                    if 'Date' in df.columns:
+                        df['DateTime'] = pd.to_datetime(df['Date'], format='%m/%d/%y', errors='coerce')
+                
+                df_sorted = df.sort_values('DateTime', ascending=True).reset_index(drop=True)
+                # Drop helper column if not needed for display, or keep it. 
+                # Usually good to hide DateTime helper object, keep string Date
+                display_txns = df_sorted.drop(columns=['DateTime'], errors='ignore')
+                
+                st.dataframe(display_txns, use_container_width=True, height=400)
                 
                 # --- Daily Ledger Analysis ---
                 if not ledger_analysis_df.empty:
