@@ -390,6 +390,28 @@ if uploaded_file:
             df, balance_df, summary_df = extract_chase_transactions(uploaded_file)
             
             if not df.empty:
+                # --- Post-processing: Sort by Date ---
+                try:
+                    # Determine Year (heuristic: use year from first date if available, else 25)
+                    year_guess = "25"
+                    if 'Date' in df.columns and len(df) > 0:
+                        first_date_val = str(df.iloc[0]['Date'])
+                        if first_date_val.count('/') == 2:
+                            year_guess = first_date_val.split('/')[-1]
+
+                    def parse_date_for_sort(date_str):
+                        if not isinstance(date_str, str): return pd.NaT
+                        # Handle MM/DD format
+                        if date_str.count('/') == 1:
+                            return pd.to_datetime(f"{date_str}/{year_guess}", format='%m/%d/%y', errors='coerce')
+                        # Handle MM/DD/YY format
+                        return pd.to_datetime(date_str, errors='coerce')
+
+                    df['_sort_date'] = df['Date'].apply(parse_date_for_sort)
+                    df = df.sort_values(by='_sort_date', ascending=True).drop(columns=['_sort_date']).reset_index(drop=True)
+                except Exception as e:
+                    pass
+
                 st.success(f"Successfully extracted {len(df)} transactions!")
                 
                 # --- Account Summary Comparison Table (like boa.py) ---
