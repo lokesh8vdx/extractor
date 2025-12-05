@@ -15,9 +15,10 @@ It handles standard sections, **multi-column check tables**, and **missing check
 def parse_bank_statement(pdf_file):
     """
     Extracts structured transaction data from the Bank of America PDF statement.
-    Also extracts the Account Summary from the first page.
+    Also extracts the Account Summary from the first page and Daily Ledger Balances.
     """
     transactions = []
+    daily_ledger_entries = []
     current_section = "Unknown"
     extracted_summary = {}
     
@@ -27,6 +28,10 @@ def parse_bank_statement(pdf_file):
     # 2. Specific Check Pattern: Date | Optional Check # | Amount
     check_pattern = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(?:(\d+\*?)\s+)?(\-?[\d,]+\.\d{2})')
     
+    # 3. Daily Ledger Pattern: Date (MM/DD) | Balance
+    # Handles multiple entries per line: 04/01 923.52 04/11 426.89
+    ledger_pattern = re.compile(r'(\d{2}/\d{2})\s+((?:-)?[\d,]+\.\d{2})')
+
     # Patterns to ignore (Headers, Footers, Page Info)
     ignore_patterns = [
         r'^Date\s+Description\s+Amount',
@@ -49,15 +54,12 @@ def parse_bank_statement(pdf_file):
         r'^Data\s+connection\s+required',
         r'^To\s+learn\s+more',
         r'^Subtotal\s+',
-        r'^Note\s+your\s+Ending\s+Balance'
+        r'^Note\s+your\s+Ending\s+Balance',
+        r'^Date\s+Balance\s+\(\$\)' # Header for ledger
     ]
     ignore_regex = re.compile('|'.join(ignore_patterns), re.IGNORECASE)
     
     # Summary Patterns
-    # Updated to handle potential negative signs and optional dollar signs for all fields
-    # (?:-)? matches an optional negative sign
-    # \$? matches an optional dollar sign
-    # [\d,]+\.\d{2} matches the amount
     summary_patterns = {
         "Beginning Balance": re.compile(r"Beginning balance on .*? ((?:-)?\$?[\d,]+\.\d{2})"),
         "Deposits/Credits": re.compile(r"Deposits and other credits\s+((?:-)?\$?[\d,]+\.\d{2})"),
@@ -73,7 +75,7 @@ def parse_bank_statement(pdf_file):
         "Withdrawals and other debits": "Withdrawals",
         "Checks": "Checks",
         "Service fees": "Service Fees",
-        "Daily ledger balances": "Ignore" # Stop parsing when we hit the footer summary
+        "Daily ledger balances": "Daily Ledger"
     }
 
     with pdfplumber.open(pdf_file) as pdf:
@@ -109,29 +111,23 @@ def parse_bank_statement(pdf_file):
                 # --- 1. Detect Section Change ---
                 section_found = False
                 for key, section_name in section_keywords.items():
-                    # Check if the line *starts with* or acts as a clear header to avoid false positives in descriptions
-                    # Original code was 'if key in line'. Kept simple but added length check to avoid partial matches if needed.
-                    # However, strictly sticking to original logic for section detection to avoid regressions, 
-                    # but we must ensure we don't append section headers to descriptions.
                     if key in line:
                         current_section = section_name
                         section_found = True
                         last_txn_index = None # Reset context
                         break
                 
-                if section_found or current_section == "Ignore":
+                if section_found:
                     continue
                 
                 # Check for Footer/Noise lines
                 if ignore_regex.search(line):
-                    # If we hit a footer/header/noise line, assume the previous transaction's 
-                    # multi-line description has ended.
                     last_txn_index = None 
                     continue
 
                 # --- 2. Parse Based on Section Type ---
                 
-                # LOGIC FOR CHECKS (Multi-Column & Optional Check #)
+                # LOGIC FOR CHECKS
                 if current_section == "Checks":
                     matches = check_pattern.findall(line)
                     
@@ -158,11 +154,27 @@ def parse_bank_statement(pdf_file):
                                 "Type": current_section,
                                 "Source_Page": page.page_number
                             })
-                        # Reset index because checks don't typically have continuation lines in this layout
                         last_txn_index = None 
-                            
-                # LOGIC FOR DEPOSITS, WITHDRAWALS, FEES (Single Column / General)
-                else:
+
+                # LOGIC FOR DAILY LEDGER
+                elif current_section == "Daily Ledger":
+                    matches = ledger_pattern.findall(line)
+                    if matches:
+                        for m in matches:
+                            l_date = m[0]
+                            l_bal_str = m[1].replace(',', '')
+                            try:
+                                l_bal = float(l_bal_str)
+                                daily_ledger_entries.append({
+                                    "Date": l_date,
+                                    "Balance": l_bal
+                                })
+                            except ValueError:
+                                pass
+                    last_txn_index = None
+
+                # LOGIC FOR DEPOSITS, WITHDRAWALS, FEES
+                elif current_section in ["Deposits", "Withdrawals", "Service Fees"]:
                     match = date_start_pattern.match(line)
                     if match:
                         date = match.group(1)
@@ -181,25 +193,21 @@ def parse_bank_statement(pdf_file):
                             "Type": current_section,
                             "Source_Page": page.page_number
                         })
-                        # Track this transaction for potential multi-line descriptions
                         last_txn_index = len(transactions) - 1
                     
                     else:
                         # --- Handle Multi-line Descriptions ---
-                        # If it's not a new transaction (no date match), 
-                        # check if we should append this line to the previous transaction.
-                        if last_txn_index is not None and current_section in ["Deposits", "Withdrawals", "Service Fees"]:
+                        if last_txn_index is not None:
                             clean_line = line.strip()
                             if clean_line:
                                 transactions[last_txn_index]["Description"] += " " + clean_line
             
-            # Update progress
             progress_bar.progress((idx + 1) / total_pages)
         
         progress_bar.empty()
         status_text.empty()
 
-    return pd.DataFrame(transactions), extracted_summary
+    return pd.DataFrame(transactions), extracted_summary, pd.DataFrame(daily_ledger_entries)
 
 # --- UI ---
 uploaded_file = st.file_uploader("Upload Bank of America PDF Statement", type=['pdf'])
@@ -207,31 +215,24 @@ uploaded_file = st.file_uploader("Upload Bank of America PDF Statement", type=['
 if uploaded_file:
     with st.spinner("Extracting data from PDF..."):
         try:
-            # Create a file-like object from uploaded file
             pdf_file = io.BytesIO(uploaded_file.read())
-            df, extracted_summary = parse_bank_statement(pdf_file)
-            
-            # Filtering out 'Unknown' and 'Ignore' types
-            df = df[~df['Type'].isin(['Unknown', 'Ignore'])]
+            df, extracted_summary, ledger_df = parse_bank_statement(pdf_file)
             
             if not df.empty:
+                # Filtering out 'Unknown' types
+                df = df[~df['Type'].isin(['Unknown'])]
+                
                 st.success(f"Successfully extracted {len(df)} transactions!")
                 
-                # --- Account Summary Table ---
-                st.subheader("Account Summary Comparison")
+                # --- Computations for Validation ---
                 
-                # Calculate Computed Values
+                # 1. Summary Computation
                 computed_deposits = df[df['Type'] == 'Deposits']['Amount'].sum()
                 computed_withdrawals = df[df['Type'] == 'Withdrawals']['Amount'].sum()
                 computed_checks = df[df['Type'] == 'Checks']['Amount'].sum()
                 computed_fees = df[df['Type'] == 'Service Fees']['Amount'].sum()
                 
-                # Beginning balance is not computed from transactions, so we take extracted or 0
                 beg_bal = extracted_summary.get("Beginning Balance", 0.0)
-                
-                # Compute Ending Balance
-                # Note: Withdrawals, Checks, Fees are usually negative in the DF if parsed correctly as negative numbers.
-                # Based on the regex (r'(\-?[\d,]+\.\d{2})'), they capture the negative sign.
                 computed_ending = beg_bal + computed_deposits + computed_withdrawals + computed_checks + computed_fees
                 
                 summary_data = [
@@ -242,23 +243,83 @@ if uploaded_file:
                     {"Category": "Service Fees", "Extracted": extracted_summary.get("Service Fees", 0.0), "Computed": computed_fees, "Difference": extracted_summary.get("Service Fees", 0.0) - computed_fees},
                     {"Category": "Ending Balance", "Extracted": extracted_summary.get("Ending Balance", 0.0), "Computed": computed_ending, "Difference": extracted_summary.get("Ending Balance", 0.0) - computed_ending},
                 ]
-                
                 summary_df = pd.DataFrame(summary_data)
+
+                # 2. Ledger Computation
+                ledger_analysis_df = pd.DataFrame()
+                if not ledger_df.empty:
+                    # Determine Year from Transactions
+                    if 'Date' in df.columns and not df.empty:
+                        first_date = df.iloc[0]['Date']
+                        try:
+                            year = first_date.split('/')[-1]
+                        except:
+                            year = "25"
+                    else:
+                        year = "25"
+
+                    ledger_df['FullDate'] = ledger_df['Date'] + '/' + year
+                    ledger_df['DateTime'] = pd.to_datetime(ledger_df['FullDate'], format='%m/%d/%y', errors='coerce')
+                    ledger_df = ledger_df.sort_values('DateTime')
+                    
+                    # Prepare Transaction Data for Computation
+                    df['DateTime'] = pd.to_datetime(df['Date'], format='%m/%d/%y', errors='coerce')
+                    
+                    ledger_analysis = []
+                    
+                    for idx, row in ledger_df.iterrows():
+                        l_date = row['DateTime']
+                        l_balance = row['Balance']
+                        
+                        if pd.isnull(l_date):
+                            continue
+                            
+                        # Calculate computed balance for this date
+                        relevant_txns = df[df['DateTime'] <= l_date]
+                        txn_sum = relevant_txns['Amount'].sum()
+                        computed_bal = beg_bal + txn_sum
+                        
+                        diff = l_balance - computed_bal
+                        
+                        ledger_analysis.append({
+                            "Date": row['Date'],
+                            "Extracted Balance": l_balance,
+                            "Computed Balance": computed_bal,
+                            "Difference": diff
+                        })
+                    
+                    ledger_analysis_df = pd.DataFrame(ledger_analysis)
+
+                # --- Validation Check ---
+                summary_diffs = [d['Category'] for d in summary_data if abs(d['Difference']) > 0.01]
                 
-                # Format columns for display
+                ledger_diffs = []
+                if not ledger_analysis_df.empty:
+                    ledger_diffs = ledger_analysis_df[abs(ledger_analysis_df['Difference']) > 0.01]['Date'].tolist()
+                
+                if not summary_diffs and not ledger_diffs:
+                    st.success("✅ PASSED: All extracted values match computed balances.")
+                else:
+                    error_msg = "❌ FAILED: Discrepancies found."
+                    if summary_diffs:
+                        error_msg += f"\n\n**Summary Discrepancies:** {', '.join(summary_diffs)}"
+                    if ledger_diffs:
+                        error_msg += f"\n\n**Daily Ledger Discrepancies (Dates):** {', '.join(str(d) for d in ledger_diffs)}"
+                    st.error(error_msg)
+                
                 def format_currency(x):
                     return "${:,.2f}".format(x)
-                
+
+                # --- Account Summary Table ---
+                st.subheader("Account Summary Comparison")
                 display_df = summary_df.copy()
                 display_df['Extracted'] = display_df['Extracted'].apply(format_currency)
                 display_df['Computed'] = display_df['Computed'].apply(format_currency)
-                display_df['Difference'] = display_df['Difference'].apply(format_currency)
-                
+                # Difference shown as raw number
                 st.table(display_df)
                 
                 # --- Transaction Metrics ---
                 col1, col2, col3, col4 = st.columns(4)
-                
                 col1.metric("Total Deposits", f"${computed_deposits:,.2f}")
                 col2.metric("Total Withdrawals", f"${computed_withdrawals:,.2f}")
                 col3.metric("Total Checks", f"${computed_checks:,.2f}")
@@ -268,30 +329,26 @@ if uploaded_file:
                 st.subheader("Transaction Details")
                 st.dataframe(df, use_container_width=True, height=400)
                 
+                # --- Daily Ledger Analysis ---
+                if not ledger_analysis_df.empty:
+                    st.subheader("Daily Ledger Balances Analysis")
+                    
+                    # Format for display
+                    display_ledger = ledger_analysis_df.copy()
+                    display_ledger['Extracted Balance'] = display_ledger['Extracted Balance'].apply(format_currency)
+                    display_ledger['Computed Balance'] = display_ledger['Computed Balance'].apply(format_currency)
+                    # Difference shown as raw number
+                    st.table(display_ledger)
+                
                 # Download Buttons
                 col1, col2 = st.columns(2)
-                
-                # CSV Download
                 csv = df.to_csv(index=False).encode('utf-8')
-                col1.download_button(
-                    "Download as CSV",
-                    csv,
-                    "bank_of_america_statement.csv",
-                    "text/csv",
-                    key='download-csv'
-                )
-                
-                # JSON Download
+                col1.download_button("Download as CSV", csv, "boa_transactions.csv", "text/csv", key='download-csv')
                 json_str = df.to_json(orient="records", indent=4)
-                col2.download_button(
-                    "Download as JSON",
-                    json_str,
-                    "bank_of_america_statement.json",
-                    "application/json",
-                    key='download-json'
-                )
+                col2.download_button("Download as JSON", json_str, "boa_transactions.json", "application/json", key='download-json')
+                
             else:
-                st.warning("No transactions found. Ensure this is a standard Bank of America PDF statement.")
+                st.warning("No transactions found.")
                 
         except Exception as e:
             st.error(f"Error parsing PDF: {str(e)}")
@@ -299,19 +356,6 @@ if uploaded_file:
 
 with st.expander("Regex Logic Explained"):
     st.code(r"""
-# The Updated Check Pattern
-# (?: ... )? means the group inside is optional
-# \d+\*? matches the check number (digits) plus an optional asterisk
-
 check_pattern = re.compile(r'(\d{2}/\d{2}/\d{2})\s+(?:(\d+\*?)\s+)?(\-?[\d,]+\.\d{2})')
-
-# Example Match 1 (With Check #): "04/10/25 120 -2,000.00"
-# Group 1 (Date): "04/10/25"
-# Group 2 (Check): "120"
-# Group 3 (Amount): "-2,000.00"
-
-# Example Match 2 (No Check #): "04/08/25 -366.00"
-# Group 1 (Date): "04/08/25"
-# Group 2 (Check): "" (Empty)
-# Group 3 (Amount): "-366.00"
+ledger_pattern = re.compile(r'(\d{2}/\d{2})\s+((?:-)?[\d,]+\.\d{2})')
     """, language="python")
