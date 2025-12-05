@@ -33,7 +33,8 @@ def extract_chase_transactions(pdf_file):
         for i, page in enumerate(pdf.pages):
             page_num = i + 1
             # Extract text with layout preservation
-            text = page.extract_text(x_tolerance=2, y_tolerance=2)
+            # Reduced y_tolerance to handle interleaved hidden text (e.g. "checks paid section" overlapping with check numbers)
+            text = page.extract_text(x_tolerance=2, y_tolerance=0.3)
             if not text:
                 continue
             lines = text.split('\n')
@@ -64,6 +65,39 @@ def extract_chase_transactions(pdf_file):
             for line in lines:
                 line = line.strip()
                 
+                # Global Noise Filtering
+                # Skip watermark lines
+                if "WM" in line and "bbcd" in line:
+                    continue
+                if line.startswith("WM") or "%%WM" in line:
+                    continue
+                
+                # Skip hidden text markers if they appear on their own line
+                # Also skip "Total Checks Paid" footer and common disclaimer text
+                if "*start*" in line or "*end*" in line or "Total Checks Paid" in line:
+                    continue
+                
+                if "If you see a description" in line or "return the check to you" in line:
+                    continue
+                
+                if "All of your recent checks" in line or "An image of this check" in line:
+                    continue
+                
+                # Additional specific filter for broken disclaimer line
+                if "one of your previous statements" in line:
+                    continue
+                
+                # Filter out single letter noise lines like "d d", "c c"
+                if re.match(r'^([a-zA-Z]\s)+[a-zA-Z]$', line) and len(line) < 10:
+                    continue
+
+                # Skip "Total ..." footer lines for various sections
+                if line.startswith("Total ") and ("Deposits" in line or "Withdrawals" in line or "Fees" in line or "Purchases" in line or "Credits" in line):
+                    continue
+                
+                if "ATM & Debit Card Totals" in line:
+                    continue
+
                 # Detect Sections to categorize transactions
                 if "CHECKING SUMMARY" in line:
                     current_section = "Checking Summary"
@@ -281,6 +315,10 @@ def extract_chase_transactions(pdf_file):
                     # Ensure we don't append lines from a new page to a previous page's transaction
                     if transactions[-1]['Page'] != page_num:
                         continue
+                    
+                    # Ensure we don't append lines if the section has changed (e.g. previous txn was Deposit, now we are in Checks Paid header)
+                    if current_section != transactions[-1]['Type']:
+                        continue
 
                     # Skip if it looks like a balance summary line (Chase specific noise)
                     if "$" in line and "Balance" in line:
@@ -297,9 +335,44 @@ def extract_chase_transactions(pdf_file):
 
                     # Skip potential header/footer junk and noise markers
                     if "DATE DESCRIPTION" in line or \
+                       "DATE AMOUNT" in line or \
+                       "CHECK NO." in line or \
                        "Account Number" in line or \
                        re.match(r'^[\d\s]+$', line) or \
                        ("through" in line and re.search(r'\d{4}', line)):
+                        continue
+
+                    # Clean up trailing "DATE AMOUNT" if it got appended
+                    if transactions and transactions[-1]["Description"].endswith(" DATE AMOUNT"):
+                         transactions[-1]["Description"] = transactions[-1]["Description"].replace(" DATE AMOUNT", "")
+
+
+                    # Skip fee explanation text noise
+                    if "Excess Transaction Fees" in line or "Your total transactions" in line:
+                        continue
+                    if "You can use" in line or "Paper checks written" in line or "Deposits and withdrawals" in line:
+                        continue
+                    if "Monthly Service Fee of either" in line or "sum of the Monthly Service Fee" in line:
+                        continue
+                    
+                    # Prevent duplication of Fee Description if line matches exactly (case-insensitive)
+                    if transactions[-1]["Description"].lower() == line.lower():
+                        continue
+                        
+                    # Special case for Monthly Service Fee which often repeats in footer
+                    if "Monthly Service Fee" in transactions[-1]["Description"] and "Monthly Service Fee" in line:
+                        continue
+
+                    # Skip lines that are just bullet points or special chars
+                    if re.match(r'^[\W_]+$', line):
+                        continue
+
+                    # Skip tracking ID noise (long alphanumeric strings with hyphens)
+                    # Matches "Digits-Alphanum" (e.g. 8979617741571-RAIFtklQ00000kQs20)
+                    if re.search(r'\d+-[A-Za-z0-9]+', line):
+                        continue
+                    # Matches "Alphanum-Digits" (e.g. 4De20Fca304F-0000003)
+                    if re.search(r'[A-Za-z0-9]+-\d+', line) and len(line) > 15:
                         continue
                         
                     # Append to previous transaction description
